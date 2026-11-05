@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "sup-score-growth: a sup-score test for adding hidden units to neural networks"
+authors:
+  - family-names: "AL Mohamad"
+    given-names: "Mohamad Yamen"
+    affiliation: "Department of Statistics, University of Tabriz"
+version: 1.0.0
+date-released: 2026-11-05
+license: MIT
+repository-code: "https://github.com/yamenetoo/sup-score-growth"
+keywords:
+  - neural networks
+  - network growth
+  - hypothesis testing
+  - score test
+  - bootstrap

@@ -1,0 +1,44 @@
+== california ==
+Friedman (MSE, 10 methods): chi2=36.26, p=3.57e-05
+suplm vs bonf: mean MSE diff 0.0000, Wilcoxon Holm p=1
+suplm vs lwg: mean MSE diff -0.0040, Wilcoxon Holm p=0.125
+suplm vs tlg: mean MSE diff -0.0032, Wilcoxon Holm p=1
+suplm vs corr: mean MSE diff -0.0075, Wilcoxon Holm p=0.0352
+suplm vs ash: mean MSE diff -0.0002, Wilcoxon Holm p=1
+suplm vs valgrow: mean MSE diff -0.0010, Wilcoxon Holm p=1
+suplm vs aic: mean MSE diff 0.0000, Wilcoxon Holm p=1
+suplm vs bic: mean MSE diff 0.0000, Wilcoxon Holm p=1
+suplm vs nic: mean MSE diff 0.0000, Wilcoxon Holm p=1
+== cpu_act ==
+Friedman (MSE, 10 methods): chi2=14.01, p=0.122
+suplm vs bonf: mean MSE diff 0.0000, Wilcoxon Holm p=1
+suplm vs lwg: mean MSE diff -0.0022, Wilcoxon Holm p=0.949
+suplm vs tlg: mean MSE diff 0.0004, Wilcoxon Holm p=1
+suplm vs corr: mean MSE diff -0.0006, Wilcoxon Holm p=1
+suplm vs ash: mean MSE diff 0.0003, Wilcoxon Holm p=1
+suplm vs valgrow: mean MSE diff 0.0004, Wilcoxon Holm p=1
+suplm vs aic: mean MSE diff 0.0003, Wilcoxon Holm p=1
+suplm vs bic: mean MSE diff -0.0002, Wilcoxon Holm p=1
+suplm vs nic: mean MSE diff 0.0003, Wilcoxon Holm p=1
+== diabetes ==
+Friedman (MSE, 10 methods): chi2=78.59, p=3.08e-13
+suplm vs bonf: mean MSE diff 0.0000, Wilcoxon Holm p=1
+suplm vs lwg: mean MSE diff -0.0044, Wilcoxon Holm p=1
+suplm vs tlg: mean MSE diff -0.0058, Wilcoxon Holm p=1
+suplm vs corr: mean MSE diff -0.2421, Wilcoxon Holm p=0.0176
+suplm vs ash: mean MSE diff -0.2421, Wilcoxon Holm p=0.0176
+suplm vs valgrow: mean MSE diff -0.0034, Wilcoxon Holm p=1
+suplm vs aic: mean MSE diff -0.2423, Wilcoxon Holm p=0.0176
+suplm vs bic: mean MSE diff 0.0000, Wilcoxon Holm p=1
+suplm vs nic: mean MSE diff -0.2423, Wilcoxon Holm p=0.0176
+== kin8nm ==
+Friedman (MSE, 10 methods): chi2=16.72, p=0.0533
+suplm vs bonf: mean MSE diff 0.0000, Wilcoxon Holm p=1
+suplm vs lwg: mean MSE diff -0.2502, Wilcoxon Holm p=0.281
+suplm vs tlg: mean MSE diff 0.0000, Wilcoxon Holm p=1
+suplm vs corr: mean MSE diff 0.0000, Wilcoxon Holm p=1
+suplm vs ash: mean MSE diff 0.0000, Wilcoxon Holm p=1
+suplm vs valgrow: mean MSE diff -0.0018, Wilcoxon Holm p=1
+suplm vs aic: mean MSE diff 0.0000, Wilcoxon Holm p=1
+suplm vs bic: mean MSE diff 0.0000, Wilcoxon Holm p=1
+suplm vs nic: mean MSE diff 0.0000, Wilcoxon Holm p=1

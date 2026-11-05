@@ -1,0 +1,18 @@
+== n=500 ==
+Friedman (MSE, 8 rules): chi2=401.31, p=1.25e-82
+suplm vs schedule: mean MSE diff -0.0392, Wilcoxon Holm p=2.81e-17
+suplm vs full: mean MSE diff -0.0340, Wilcoxon Holm p=2.81e-17
+suplm vs suplm_v1: mean MSE diff -0.0475, Wilcoxon Holm p=5.92e-17
+suplm vs valgrow: mean MSE diff -0.0109, Wilcoxon Holm p=3.02e-07
+suplm vs gradmax: mean MSE diff -0.0097, Wilcoxon Holm p=6.31e-07
+suplm vs oracle: mean MSE diff -0.0110, Wilcoxon Holm p=1.15e-05
+suplm vs suplm_s22: mean MSE diff 0.0040, Wilcoxon Holm p=0.000286
+== n=2000 ==
+Friedman (MSE, 8 rules): chi2=513.29, p=1.11e-106
+suplm vs suplm_v1: mean MSE diff -0.0114, Wilcoxon Holm p=2.73e-17
+suplm vs gradmax: mean MSE diff 0.0020, Wilcoxon Holm p=2.73e-17
+suplm vs schedule: mean MSE diff -0.0071, Wilcoxon Holm p=2.73e-17
+suplm vs suplm_s22: mean MSE diff 0.0019, Wilcoxon Holm p=2.73e-17
+suplm vs full: mean MSE diff -0.0044, Wilcoxon Holm p=1.6e-16
+suplm vs valgrow: mean MSE diff -0.0000, Wilcoxon Holm p=1.76e-07
+suplm vs oracle: mean MSE diff -0.0027, Wilcoxon Holm p=0.0062

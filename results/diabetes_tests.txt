@@ -1,0 +1,10 @@
+Friedman (MSE, 10 methods): chi2=79.01, p=2.54e-13
+suplm vs bonf: mean MSE diff 0.0185, Wilcoxon Holm p=1
+suplm vs lwg: mean MSE diff 0.0183, Wilcoxon Holm p=1
+suplm vs tlg: mean MSE diff 0.0185, Wilcoxon Holm p=1
+suplm vs corr: mean MSE diff -0.2383, Wilcoxon Holm p=0.0176
+suplm vs ash: mean MSE diff -0.2422, Wilcoxon Holm p=0.0176
+suplm vs valgrow: mean MSE diff 0.0055, Wilcoxon Holm p=1
+suplm vs aic: mean MSE diff -0.2497, Wilcoxon Holm p=0.0176
+suplm vs bic: mean MSE diff 0.0165, Wilcoxon Holm p=1
+suplm vs nic: mean MSE diff -0.2445, Wilcoxon Holm p=0.0176
