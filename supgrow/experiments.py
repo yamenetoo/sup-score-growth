@@ -8,6 +8,7 @@ Experiments (results/ files):
             3 sample sizes, 3 vs 10 random restarts, cost of each rule
             ......................................... growth.csv, growth_tests.txt
   real   E4 four real data sets, 10-fold CV ......... real.csv, real_summary.csv, real_tests.txt
+  kmax   E4b real data at several K_max (8,12,16,24) .. kmax.csv, kmax_summary.csv
   sens   E5 sensitivity to grid size/scale and the variance estimator
             ......................................... sensitivity.csv
   init   E6 one-step initialisation of the new unit . init.csv
@@ -25,6 +26,8 @@ Examples
   python -m supgrow.experiments all --devices cuda --batch 100
   python -m supgrow.experiments growth real --devices cuda  # several experiments
   python -m supgrow.experiments deep --verbose 2
+  python -m supgrow.experiments real --kmax 16            # E4 with K_max = 16
+  python -m supgrow.experiments kmax --kmax-levels 8 12 16 24
 """
 import argparse
 import math
@@ -191,12 +194,13 @@ def grid_for(d, M, seed):
 CRITERIA = ("aic", "bic", "nic")
 
 
-def _select_and_score(Xt, y, Xte, yte, K_max, Gamma, gen, restarts=3):
+def _fit_and_select(Xt, y, Xte, yte, K_max, Gamma, gen, restarts=3):
     """Common path on all data, path on an 80% split for validation growth,
-    all rules, test MSE of each selected network, and cost accounting."""
+    and all decision rules. Returns everything needed by _score, so that the
+    selections can be scored for K_max and for any smaller maximal size."""
     b, n, d = Xt.shape
     t0 = time.time()
-    gt.log(1, f"  step 1/3: common path on all {n} observations")
+    gt.log(1, f"  step 1/3: common path on all {n} observations (K = 0..{K_max})")
     thetas, rss, tfit = gt.fit_path(Xt, y, K_max, Gamma, gen, n_random=restarts, return_times=True)
     perm = torch.rand(b, n, generator=gen, device=DEVICE).argsort(1)
     ntr = int(0.8 * n)
@@ -207,16 +211,30 @@ def _select_and_score(Xt, y, Xte, yte, K_max, Gamma, gen, restarts=3):
     th_tr, _, tfit_tr = gt.fit_path(take(Xt, idx_tr), take(y, idx_tr), K_max, Gamma, gen,
                                     n_random=restarts, return_times=True)
     gt.log(1, f"  step 3/3: applying the decision rules (bootstrap B={B})")
-    sel, pv, ttest = gt.select_all(thetas, rss, Xt, y, Gamma, gen, B=B,
-                                   val=(take(Xt, idx_va), take(y, idx_va), th_tr),
-                                   return_info=True)
+    sel, pv, ttest, crit = gt.select_all(thetas, rss, Xt, y, Gamma, gen, B=B,
+                                         val=(take(Xt, idx_va), take(y, idx_va), th_tr),
+                                         return_info=True, return_crit=True)
     mse_full = gt.path_mse(thetas, Xte, yte)
     mse_tr = gt.path_mse(th_tr, Xte, yte)
     gt.log(1, f"  test MSE by size K=0..{K_max}: " +
            " ".join(f"{v:.3f}" for v in mse_full.mean(0).tolist()) + f"  ({time.time() - t0:.0f}s)")
-    cf = np.cumsum(tfit)                      # time to fit sizes 1..K
-    cf_tr = np.cumsum(tfit_tr)
-    ct = np.cumsum(ttest)                     # time of sup-LM tests at sizes 0..K
+    return dict(sel=sel, pv=pv, crit=crit, mse_full=mse_full, mse_tr=mse_tr,
+                cf=np.cumsum(tfit), cf_tr=np.cumsum(tfit_tr), ct=np.cumsum(ttest))
+
+
+def _truncate(sel, crit, L):
+    """Selections that the same rules would make with maximal size L <= K_max.
+    Forward rules stop at the first non-rejection, so their size is min(K, L);
+    criteria are minimised over the sizes 0..L."""
+    out = {}
+    for m, K in sel.items():
+        out[m] = crit[m][:, :L + 1].argmin(1) if m in gt.CRIT_NAMES else torch.clamp(K, max=L)
+    return out
+
+
+def _score(sel, f, K_max):
+    """Test MSE of each selected network and cost accounting for maximal size K_max."""
+    mse_full, mse_tr, cf, cf_tr, ct = f["mse_full"], f["mse_tr"], f["cf"], f["cf_tr"], f["ct"]
     out = {}
     for m, K in sel.items():
         src = mse_tr if m == "valgrow" else mse_full
@@ -235,7 +253,14 @@ def _select_and_score(Xt, y, Xte, yte, K_max, Gamma, gen, restarts=3):
         else:                                  # forward: sizes 1..K fitted, tests at 0..K
             out[f"fits_{m}"] = Kn
             out[f"time_{m}"] = cf[Kn] + (ct[np.minimum(Kn, K_max - 1)] if m == "suplm" else 0.0)
-    return out, mse_full.double().cpu().numpy(), pv.double().cpu().numpy()
+    return out
+
+
+def _select_and_score(Xt, y, Xte, yte, K_max, Gamma, gen, restarts=3):
+    """Common path, all rules, test MSE of each selected network and cost."""
+    f = _fit_and_select(Xt, y, Xte, yte, K_max, Gamma, gen, restarts=restarts)
+    out = _score(f["sel"], f, K_max)
+    return out, f["mse_full"].double().cpu().numpy(), f["pv"].double().cpu().numpy()
 
 
 def task_growth(t):
@@ -275,18 +300,24 @@ def load_real(name):
     return np.asarray(X, dtype=np.float64), np.asarray(y, dtype=np.float64)
 
 
-def task_real(t):
+def _real_fold(t):
+    """Standardised train/test tensors of one CV fold of a real data set."""
     from sklearn.model_selection import KFold
     X, y = load_real(t["data"])
     tr, te = list(KFold(n_splits=t["folds"], shuffle=True, random_state=2026).split(X))[t["fold"]]
-    gen = _gen(t["seed"])
     mu, sd = X[tr].mean(0), X[tr].std(0)
     sd[sd == 0] = 1.0
     ym, ys = y[tr].mean(), y[tr].std()
     T = lambda A: torch.as_tensor(A, dtype=DTYPE, device=DEVICE)[None]
     Xtr, Xte = gt.add_intercept(T((X[tr] - mu) / sd)), gt.add_intercept(T((X[te] - mu) / sd))
     ytr, yte = T((y[tr] - ym) / ys), T((y[te] - ym) / ys)
-    d, K_max = Xtr.shape[2], 8
+    return X, Xtr, ytr, Xte, yte
+
+
+def task_real(t):
+    X, Xtr, ytr, Xte, yte = _real_fold(t)
+    gen = _gen(t["seed"])
+    d, K_max = Xtr.shape[2], t.get("K_max", 8)
     Gamma = grid_for(d, 2000, 2026)
     gt.log(1, f"  data {t['data']}: n_train={Xtr.shape[1]}, p={d - 1}")
     out, mse_all, pv = _select_and_score(Xtr, ytr, Xte, yte, K_max, Gamma, gen, restarts=t["restarts"])
@@ -295,6 +326,29 @@ def task_real(t):
     row.update(data=t["data"], fold=t["fold"], n=X.shape[0], p=X.shape[1],
                p_values=";".join(f"{q:.3f}" for q in pv[0]))
     return [row]
+
+
+def task_kmax(t):
+    """One CV fold, one path up to the largest K_max level; every rule is then
+    evaluated at every level (the forward rules stop at min(K, level), the
+    criteria are minimised over 0..level), so no size is fitted twice."""
+    X, Xtr, ytr, Xte, yte = _real_fold(t)
+    gen = _gen(t["seed"])
+    levels = sorted(t["levels"])
+    d, Ktop = Xtr.shape[2], levels[-1]
+    Gamma = grid_for(d, 2000, 2026)
+    gt.log(1, f"  data {t['data']}: n_train={Xtr.shape[1]}, p={d - 1}, K_max levels {levels}")
+    f = _fit_and_select(Xtr, ytr, Xte, yte, Ktop, Gamma, gen, restarts=t["restarts"])
+    rows = []
+    for L in levels:
+        out = _score(_truncate(f["sel"], f["crit"], L), f, L)
+        row = {k: v[0] for k, v in out.items()}
+        row.update(data=t["data"], fold=t["fold"], K_max=L, n=X.shape[0], p=X.shape[1])
+        rows.append(row)
+        gt.log(1, f"  K_max={L:2d}: " + ", ".join(f"{m} K={int(out[f'K_{m}'][0])}" for m in METHODS))
+    pv = f["pv"][0].double().cpu().numpy()
+    rows[-1]["p_values"] = ";".join(f"{q:.3f}" for q in pv)
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +479,7 @@ def task_deep(t):
 
 
 TASKS = dict(size=task_size, local=task_local, growth=task_growth, real=task_real,
-             sens=task_sens, init=task_init, deep=task_deep)
+             kmax=task_kmax, sens=task_sens, init=task_init, deep=task_deep)
 
 
 def _mem():
@@ -467,6 +521,10 @@ def _summary(t, rows):
         return " | ".join(f"{m}: exact={df[f'exact_{m}'].mean():.2f} near={df[f'near_{m}'].mean():.2f} "
                           f"mse={df[f'mse_{m}'].mean():.4f}" for m in DEEP_METHODS) + \
             f" | oracle mse={df['mse_oracle'].mean():.4f}"
+    if t["exp"] == "kmax":
+        return f"{t['data']} fold {t['fold']}: " + " | ".join(
+            f"K_max={int(r['K_max'])}: suplm={int(r['K_suplm'])} bic={int(r['K_bic'])} "
+            f"valgrow={int(r['K_valgrow'])}" for _, r in df.iterrows())
     r = df.iloc[0]
     return f"{r['data']} fold {r['fold']}: K " + " ".join(f"{m}={int(r[f'K_{m}'])}" for m in METHODS) + \
         f" | test MSE suplm={r['mse_suplm']:.3f} bic={r['mse_bic']:.3f}"
@@ -699,7 +757,8 @@ def exp_real(args):
             print(f"[MAIN] data set {name}: n={X.shape[0]}, p={X.shape[1]}", flush=True)
         except Exception as e:                           # no internet, renamed data set, ...
             print(f"[MAIN] WARNING: skipping data set {name}: {type(e).__name__}: {e}", flush=True)
-    tasks = [dict(exp="real", data=nm, fold=f, folds=folds, restarts=10, seed=2026 + 100 * j + f)
+    tasks = [dict(exp="real", data=nm, fold=f, folds=folds, restarts=10, K_max=args.kmax,
+                  seed=2026 + 100 * j + f)
              for j, nm in enumerate(names) for f in range(folds)]
     df = pd.DataFrame(run_all(tasks, args)).sort_values(["data", "fold"])
     df.to_csv(f"{OUT}/real.csv", index=False)
@@ -715,8 +774,42 @@ def exp_real(args):
     tabs.to_csv(f"{OUT}/real_summary.csv", index=False)
     with open(f"{OUT}/real_tests.txt", "w") as fh:
         fh.write("\n".join(lines) + "\n")
-    show("E4 real data (10-fold CV)", tabs)
+    show(f"E4 real data (10-fold CV, K_max={args.kmax})", tabs)
     show("E4 paired comparisons with the proposed test", "\n".join(lines))
+
+
+def exp_kmax(args):
+    """E4b: the real data sets at several maximal sizes K_max (default 8, 12,
+    16, 24). Shows whether each rule stops on its own or at the cap, and how
+    the cost of the criteria grows with K_max while forward testing does not."""
+    folds = 3 if args.quick else 10
+    levels = sorted(set(args.kmax_levels if not args.quick else [4, 6]))
+    names = []
+    for name in REAL:
+        try:
+            X, _ = load_real(name)
+            names.append(name)
+            print(f"[MAIN] data set {name}: n={X.shape[0]}, p={X.shape[1]}", flush=True)
+        except Exception as e:
+            print(f"[MAIN] WARNING: skipping data set {name}: {type(e).__name__}: {e}", flush=True)
+    tasks = [dict(exp="kmax", data=nm, fold=f, folds=folds, restarts=10, levels=levels,
+                  seed=2026 + 100 * j + f)
+             for j, nm in enumerate(names) for f in range(folds)]
+    df = pd.DataFrame(run_all(tasks, args)).sort_values(["data", "K_max", "fold"])
+    df.to_csv(f"{OUT}/kmax.csv", index=False)
+    rows = []
+    for (nm, L), g in df.groupby(["data", "K_max"]):
+        for m in METHODS:
+            K = g[f"K_{m}"]
+            rows.append(dict(data=nm, K_max=L, method=m, K_median=K.median(), K_mean=K.mean(),
+                             K_min=K.min(), K_maxsel=K.max(), at_cap=np.mean(K >= L),
+                             mse_mean=g[f"mse_{m}"].mean(), mse_sd=g[f"mse_{m}"].std(),
+                             fits_mean=g[f"fits_{m}"].mean(), time_mean=g[f"time_{m}"].mean()))
+    tabs = pd.DataFrame(rows)
+    tabs.to_csv(f"{OUT}/kmax_summary.csv", index=False)
+    for what in ("K_median", "at_cap", "mse_mean", "time_mean"):
+        piv = tabs.pivot_table(index=["data", "method"], columns="K_max", values=what)
+        show(f"E4b {what} by K_max (rows: data set, method)", piv)
 
 
 def exp_sens(args):
@@ -814,7 +907,7 @@ def environment(args):
 
 
 EXPERIMENTS = dict(size=exp_size, local=exp_local, growth=exp_growth, real=exp_real,
-                   sens=exp_sens, init=exp_init, deep=exp_deep)
+                   kmax=exp_kmax, sens=exp_sens, init=exp_init, deep=exp_deep)
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -826,6 +919,10 @@ def main(argv=None):
     ap.add_argument("--workers", type=int, default=0, help="CPU worker processes (0 = half the cores)")
     ap.add_argument("--batch", type=int, default=50, help="replications per task (GPU: 50-200; CPU: 5-20)")
     ap.add_argument("--fp64", action="store_true", help="float64 on GPU too (slower on consumer GPUs)")
+    ap.add_argument("--kmax", type=int, default=8,
+                    help="maximal number of hidden units in E4 'real' (default 8; e.g. 16)")
+    ap.add_argument("--kmax-levels", type=int, nargs="+", default=[8, 12, 16, 24],
+                    help="maximal sizes compared in E4b 'kmax' (one path up to the largest)")
     ap.add_argument("--verbose", type=int, default=1, choices=[0, 1, 2],
                     help="0: progress only; 1: every fit and test (default); 2: also LM iterations")
     args = ap.parse_args(argv)

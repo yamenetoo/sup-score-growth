@@ -5,8 +5,8 @@ authors:
   - family-names: "AL Mohamad"
     given-names: "Mohamad Yamen"
     affiliation: "Department of Statistics, University of Tabriz"
-version: 1.0.0
-date-released: 2026-11-05
+version: 1.1.0
+date-released: 2026-11-06
 license: MIT
 repository-code: "https://github.com/yamenetoo/sup-score-growth"
 keywords:

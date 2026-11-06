@@ -393,9 +393,12 @@ CORR_TAUS = (0.05, 0.10, 0.20)      # MaxCorr thresholds; 0.10 is the default ru
 ASH_TAUS = (0.005, 0.01, 0.05)      # DNC thresholds; 0.01 is the default rule "ash"
 
 
+CRIT_NAMES = ("aic", "bic", "nic")
+
+
 @torch.no_grad()
 def select_all(thetas, rss, Xt, y, Gamma, gen, alpha=0.05, B=499,
-               val=None, ash_tau=0.01, corr_tau=0.10, return_info=False):
+               val=None, ash_tau=0.01, corr_tau=0.10, return_info=False, return_crit=False):
     """Apply all decision rules to a common fitted path.
     val: optional (Xt_val, y_val, thetas_tr) for validation-based growth.
     Returns dict method -> LongTensor (b,) of selected sizes, and the b x K_max
@@ -403,7 +406,11 @@ def select_all(thetas, rss, Xt, y, Gamma, gen, alpha=0.05, B=499,
     MaxCorr and DNC triggers are also evaluated at the thresholds in CORR_TAUS
     and ASH_TAUS (keys corr_<tau>, ash_<tau>) for the sensitivity analysis.
     With return_info=True also returns the per-data-set wall time of the
-    sup-LM test at each size (list, seconds)."""
+    sup-LM test at each size (list, seconds). With return_crit=True (needs
+    return_info=True) also returns a dict with the b x (K_max+1) values of
+    AIC, BIC and NIC, so that the selections can be recomputed for any
+    smaller maximal size without refitting (the forward rules only need
+    min(K, K_max'))."""
     K_max = len(thetas) - 1
     b, n, d = Xt.shape
     cols = {m: [] for m in ("suplm", "bonf", "lwg", "tlg", "corr")}
@@ -435,10 +442,10 @@ def select_all(thetas, rss, Xt, y, Gamma, gen, alpha=0.05, B=499,
     q = torch.tensor([n_params(K, d) for K in range(K_max + 1)],
                      dtype=rss.dtype, device=rss.device)
     base = n * torch.log(rss / n)
-    sel["aic"] = (base + 2 * q).argmin(1)
-    sel["bic"] = (base + math.log(n) * q).argmin(1)
-    sel["nic"] = torch.stack([nic_value(thetas[K], Xt, y, K)
-                              for K in range(K_max + 1)], 1).argmin(1)
+    crit = dict(aic=base + 2 * q, bic=base + math.log(n) * q,
+                nic=torch.stack([nic_value(thetas[K], Xt, y, K) for K in range(K_max + 1)], 1))
+    for m in CRIT_NAMES:
+        sel[m] = crit[m].argmin(1)
     if val is not None:
         Xv, yv, th_tr = val
         mse = torch.stack([((predict(th_tr[K], Xv, K) - yv) ** 2).mean(1)
@@ -449,6 +456,8 @@ def select_all(thetas, rss, Xt, y, Gamma, gen, alpha=0.05, B=499,
             continue
         counts = torch.bincount(k, minlength=K_max + 1).tolist()
         log(1, f"  selected sizes {m:8s}: counts for K=0..{K_max} {counts}")
+    if return_info and return_crit:
+        return sel, torch.stack(pv, 1), ttest, crit
     if return_info:
         return sel, torch.stack(pv, 1), ttest
     return sel, torch.stack(pv, 1)

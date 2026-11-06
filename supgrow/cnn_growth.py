@@ -1,7 +1,7 @@
 """
 Exploratory experiment: statistical growth of a convolutional network.
 
-A small tanh CNN classifies images (MNIST, Fashion-MNIST):
+A small tanh CNN classifies images (MNIST, Fashion-MNIST, CIFAR-10):
     x -> conv1 (C1 filters, 3x3) -> tanh -> 2x2 average pool
       -> conv2 (C2 filters, 3x3) -> tanh -> average pool to 3x3 -> linear (10 classes)
 (The 3x3 pooled grid keeps coarse spatial information; a global average pool
@@ -31,6 +31,10 @@ Rules compared (all start at (2, 2) filters and can reach (Cmax1, Cmax2)):
                largest T / critical value if it exceeds 1, otherwise stop
   gradmax      add to the layer with the largest normalised score norm if > tau
   schedule     add a filter after every training round, alternating layers
+               (random new filter)
+  gradmax_sched  GradMax-style growth: the same fixed schedule up to the
+               maximal widths, but each new filter is the candidate with the
+               largest gradient norm of its (zero) outgoing weights
   suplm_refit  the widths chosen by suplm, trained from scratch for the same
                number of epochs as the suplm run (separates the effect of the
                architecture from the effect of growing / longer training)
@@ -41,7 +45,9 @@ Rules compared (all start at (2, 2) filters and can reach (Cmax1, Cmax2)):
 Usage:
   python -m supgrow.cnn_growth --quick               # small check
   python -m supgrow.cnn_growth --data mnist fashion --seeds 5
-Results: results/cnn_raw.csv, results/cnn.csv, results/cnn_log.txt
+  python -m supgrow.cnn_growth --preset cifar        # CIFAR-10 (E9)
+Results: results/<name>_raw.csv, results/<name>.csv, results/<name>_log.txt with
+<name> = cnn (default) or cifar (--preset cifar), set by --out-name.
 """
 import argparse
 import math
@@ -71,29 +77,37 @@ def log(msg):
 # Data
 # ---------------------------------------------------------------------------
 def load_data(name, n_train, device, seed=0):
-    """Return standardised tensors Xtr (n,1,28,28), ytr, Xte, yte."""
-    X = y = None
+    """Return standardised tensors Xtr (n,C,H,W), ytr, Xte, yte.
+    MNIST / Fashion-MNIST: C=1, 28x28. CIFAR-10: C=3, 32x32 (per-channel scaling)."""
     try:
         import torchvision
         ds = {"mnist": torchvision.datasets.MNIST,
-              "fashion": torchvision.datasets.FashionMNIST}[name]
+              "fashion": torchvision.datasets.FashionMNIST,
+              "cifar10": torchvision.datasets.CIFAR10}[name]
         tr = ds(root="data", train=True, download=True)
         te = ds(root="data", train=False, download=True)
-        Xtr, ytr = tr.data.float() / 255.0, tr.targets.long()
-        Xte, yte = te.data.float() / 255.0, te.targets.long()
+        if name == "cifar10":
+            Xtr = torch.tensor(tr.data).permute(0, 3, 1, 2).float() / 255.0
+            Xte = torch.tensor(te.data).permute(0, 3, 1, 2).float() / 255.0
+            ytr, yte = torch.tensor(tr.targets).long(), torch.tensor(te.targets).long()
+        else:
+            Xtr, ytr = tr.data.float()[:, None] / 255.0, tr.targets.long()
+            Xte, yte = te.data.float()[:, None] / 255.0, te.targets.long()
     except Exception as e:                                   # no torchvision: OpenML
         log(f"torchvision not usable ({type(e).__name__}); loading {name} from OpenML")
         from sklearn.datasets import fetch_openml
-        oml = {"mnist": "mnist_784", "fashion": "Fashion-MNIST"}[name]
+        oml = {"mnist": "mnist_784", "fashion": "Fashion-MNIST", "cifar10": "CIFAR_10"}[name]
         X, y = fetch_openml(oml, version=1, return_X_y=True, as_frame=False, parser="auto")
-        X = torch.tensor(X, dtype=torch.float32).reshape(-1, 28, 28) / 255.0
-        y = torch.tensor(y.astype(int), dtype=torch.long)
-        Xtr, ytr, Xte, yte = X[:60000], y[:60000], X[60000:], y[60000:]
+        shape = (-1, 3, 32, 32) if name == "cifar10" else (-1, 1, 28, 28)
+        X = torch.tensor(np.asarray(X, dtype=np.float32)).reshape(shape) / 255.0
+        y = torch.tensor(np.asarray(y).astype(int), dtype=torch.long)
+        Xtr, ytr, Xte, yte = X[:-10000], y[:-10000], X[-10000:], y[-10000:]
     g = torch.Generator().manual_seed(seed)
     idx = torch.randperm(Xtr.shape[0], generator=g)[:n_train]
     Xtr, ytr = Xtr[idx], ytr[idx]
-    mu, sd = Xtr.mean(), Xtr.std()
-    f = lambda A: ((A - mu) / sd)[:, None].to(device)
+    mu = Xtr.mean((0, 2, 3), keepdim=True)
+    sd = Xtr.std((0, 2, 3), keepdim=True)
+    f = lambda A: ((A - mu) / sd).to(device)
     return f(Xtr), ytr.to(device), f(Xte), yte.to(device)
 
 
@@ -105,10 +119,10 @@ NPOS = POOL * POOL
 
 
 class GrowCNN(nn.Module):
-    def __init__(self, Cmax=(16, 16), init=(2, 2), n_classes=10):
+    def __init__(self, Cmax=(16, 16), init=(2, 2), n_classes=10, in_ch=1):
         super().__init__()
-        self.Cmax = Cmax
-        self.conv1 = nn.Conv2d(1, Cmax[0], 3, padding=1)
+        self.Cmax, self.in_ch = Cmax, in_ch
+        self.conv1 = nn.Conv2d(in_ch, Cmax[0], 3, padding=1)
         self.conv2 = nn.Conv2d(Cmax[0], Cmax[1], 3, padding=1)
         self.fc = nn.Linear(Cmax[1] * NPOS, n_classes)
         m1 = torch.zeros(Cmax[0]); m1[:init[0]] = 1
@@ -150,7 +164,7 @@ class GrowCNN(nn.Module):
 
     def n_params(self):
         c1, c2 = self.widths()
-        return c1 * (9 + 1) + c2 * (9 * c1 + 1) + self.fc.out_features * (c2 * NPOS + 1)
+        return c1 * (9 * self.in_ch + 1) + c2 * (9 * c1 + 1) + self.fc.out_features * (c2 * NPOS + 1)
 
 
 def train(model, X, y, epochs, lr=2e-3, bs=128, gen=None):
@@ -263,24 +277,26 @@ def layer_test(model, X, y, layer, M, B, gen, trim=1e-2, chunk_m=16):
         return dict(p=p, T=T, tstar=ts, kernel=Kc[j], bias=bc[j], gnorm=float(gn.max()),
                     kernel_g=Kc[int(gn.argmax())], bias_g=bc[int(gn.argmax())])
     # layer 0: candidate filter in conv1, its pooled map feeds conv2
-    Kc, bc = candidates(0, M, 1, gen, X.device)
+    Kc, bc = candidates(0, M, model.in_ch, gen, X.device)
     C2 = model.Cmax[1]
-    d2f = (d2 * a2m[None, :, None, None]).detach().flatten(2)        # n x C2 x 196
-    pm = p1[:, a1m]                                                   # n x c1 x 14 x 14
-    Bm = torch.cat([torch.ones(n * 196, 1, device=X.device),
-                    pm.permute(0, 2, 3, 1).reshape(n * 196, -1)], 1)
+    H2 = p1.shape[-1]                                                 # 14 (28x28 input) or 16 (32x32)
+    HW = H2 * H2
+    d2f = (d2 * a2m[None, :, None, None]).detach().flatten(2)        # n x C2 x HW
+    pm = p1[:, a1m]                                                   # n x c1 x H2 x H2
+    Bm = torch.cat([torch.ones(n * HW, 1, device=X.device),
+                    pm.permute(0, 2, 3, 1).reshape(n * HW, -1)], 1)
     Wobs = torch.empty(n, M, C2 * 9, device=X.device)
     keep = torch.zeros(M, dtype=torch.bool, device=X.device)
     for k0 in range(0, M, chunk_m):
         k1 = min(M, k0 + chunk_m)
-        hp = F.avg_pool2d(torch.tanh(F.conv2d(X, Kc[k0:k1], bc[k0:k1], padding=1)), 2)   # n x mc x 14 x 14
+        hp = F.avg_pool2d(torch.tanh(F.conv2d(X, Kc[k0:k1], bc[k0:k1], padding=1)), 2)   # n x mc x H2 x H2
         mc = k1 - k0
-        Hflat = hp.permute(0, 2, 3, 1).reshape(n * 196, mc)
+        Hflat = hp.permute(0, 2, 3, 1).reshape(n * HW, mc)
         Ht = _residualise(Hflat, Bm)
         keep[k0:k1] = (Ht * Ht).sum(0) / (Hflat * Hflat).sum(0).clamp_min(TINY) > trim
-        ht = Ht.reshape(n, 14, 14, mc).permute(0, 3, 1, 2)            # n x mc x 14 x 14
-        U = F.unfold(ht.reshape(n * mc, 1, 14, 14), 3, padding=1)      # (n mc) x 9 x 196
-        U = U.reshape(n, mc, 9, 196)
+        ht = Ht.reshape(n, H2, H2, mc).permute(0, 3, 1, 2)            # n x mc x H2 x H2
+        U = F.unfold(ht.reshape(n * mc, 1, H2, H2), 3, padding=1)      # (n mc) x 9 x HW
+        U = U.reshape(n, mc, 9, HW)
         Wobs[:, k0:k1] = torch.einsum("njp,nkup->nkju", d2f, U).reshape(n, mc, C2 * 9)
     p, T, j, gn, ts = vector_sup_test(Wobs, keep, B, gen)
     jg = int(gn.argmax())
@@ -309,9 +325,10 @@ def add_filter(model, layer, kernel, bias):
 def grow(rule, Xtr, ytr, args, gen, tag=""):
     torch.manual_seed(int(torch.randint(0, 2**31 - 1, (1,), generator=gen)))
     CM = (args.cmax1, args.cmax2)
-    model = GrowCNN(Cmax=CM, init=(2, 2)).to(Xtr.device)
+    model = GrowCNN(Cmax=CM, init=(2, 2), in_ch=Xtr.shape[1]).to(Xtr.device)
     train(model, Xtr, ytr, args.epochs0, gen=gen)
     epochs = args.epochs0
+    t_test = 0.0
     n_s = min(args.n_test, Xtr.shape[0])
     t0 = time.time()
     for step in range(CM[0] + CM[1] - 4):
@@ -321,13 +338,25 @@ def grow(rule, Xtr, ytr, args, gen, tag=""):
             break
         if rule == "schedule":
             layer = step % 2 if elig[step % 2] else elig.index(True)
-            Kc, bc = candidates(layer, 1, 1 if layer == 0 else CM[0], gen, Xtr.device)
+            Kc, bc = candidates(layer, 1, model.in_ch if layer == 0 else CM[0], gen, Xtr.device)
             add_filter(model, layer, Kc[0], bc[0])
             msg = f"layer {layer + 1}"
+        elif rule == "gradmax_sched":
+            # GradMax-style: fixed schedule to the maximal widths; the new filter is the
+            # candidate whose zero outgoing weights receive the largest gradient
+            layer = step % 2 if elig[step % 2] else elig.index(True)
+            sub = torch.randperm(Xtr.shape[0], generator=gen, device="cpu")[:n_s].to(Xtr.device)
+            t1 = time.time()
+            r = layer_test(model, Xtr[sub], ytr[sub], layer, args.M, 0, gen)
+            t_test += time.time() - t1
+            add_filter(model, layer, r["kernel_g"], r["bias_g"])
+            msg = f"layer {layer + 1}; |S|/rms={r['gnorm']:.3f}"
         else:
             sub = torch.randperm(Xtr.shape[0], generator=gen, device="cpu")[:n_s].to(Xtr.device)
+            t1 = time.time()
             res = [layer_test(model, Xtr[sub], ytr[sub], l, args.M, args.B if rule == "suplm" else 0, gen)
                    if elig[l] else None for l in range(2)]
+            t_test += time.time() - t1
             info = " | ".join(f"conv{l + 1}: p={r['p']:.3f} T={r['T']:.1f} |S|/rms={r['gnorm']:.3f}"
                               for l, r in enumerate(res) if r is not None)
             if rule == "suplm":
@@ -363,14 +392,14 @@ def grow(rule, Xtr, ytr, args, gen, tag=""):
     if w[0] >= CM[0] or w[1] >= CM[1]:
         log(f"  {tag} [{rule}] note: widths {w} reached the cap {CM} in "
             + " and ".join(f"conv{l + 1}" for l in range(2) if w[l] >= CM[l]))
-    return model, time.time() - t0, epochs
+    return model, time.time() - t0, epochs, t_test
 
 
 def fit_fixed(widths, epochs, Xtr, ytr, Xte, yte, args, seed, dev):
     """Train a network of fixed widths from scratch for a given number of epochs."""
     gen = torch.Generator(device="cpu").manual_seed(1000 * seed + 11)
     torch.manual_seed(1000 * seed + 11)
-    model = GrowCNN(Cmax=(args.cmax1, args.cmax2), init=widths).to(dev)
+    model = GrowCNN(Cmax=(args.cmax1, args.cmax2), init=widths, in_ch=Xtr.shape[1]).to(dev)
     t0 = time.time()
     train(model, Xtr, ytr, epochs, gen=gen)
     nll, acc = evaluate(model, Xte, yte)
@@ -380,7 +409,8 @@ def fit_fixed(widths, epochs, Xtr, ytr, Xte, yte, args, seed, dev):
 def run(args):
     global LOGF
     os.makedirs(OUT, exist_ok=True)
-    LOGF = open(f"{OUT}/cnn_log.txt", "a")
+    name_out = args.out_name
+    LOGF = open(f"{OUT}/{name_out}_log.txt", "a")
     dev = torch.device("cuda" if torch.cuda.is_available() and args.device != "cpu" else "cpu")
     log("=" * 70)
     log(f"torch {torch.__version__} on {dev}"
@@ -393,18 +423,20 @@ def run(args):
             Xtr, ytr, Xte, yte = load_data(name, args.n_train, dev, seed)
             log(f"data {name}, seed {seed}: train {tuple(Xtr.shape)}, test {tuple(Xte.shape)}")
             ep_rule = {}
-            for rule in ("suplm", "gradmax", "schedule"):
+            for rule in args.rules:
                 gen = torch.Generator(device="cpu").manual_seed(1000 * seed + 7)
                 tag = f"{name}/s{seed}"
-                model, tg, ep = grow(rule, Xtr, ytr, args, gen, tag)
+                model, tg, ep, tt = grow(rule, Xtr, ytr, args, gen, tag)
                 ep_rule[rule] = (model.widths(), ep)
                 nll, acc = evaluate(model, Xte, yte)
                 c1, c2 = model.widths()
                 rows.append(dict(data=name, seed=seed, rule=rule, c1=c1, c2=c2, params=model.n_params(),
                                  epochs=ep, cap1=int(c1 >= args.cmax1), cap2=int(c2 >= args.cmax2),
-                                 test_nll=nll, test_acc=acc, grow_time=tg))
+                                 test_nll=nll, test_acc=acc, grow_time=tg, test_time=tt,
+                                 test_share=tt / max(tg, TINY)))
                 log(f"  {tag} RESULT {rule}: widths {model.widths()}, params {model.n_params()}, "
-                    f"test acc {acc:.4f}, test NLL {nll:.4f}, {ep} epochs, growth time {tg:.0f}s")
+                    f"test acc {acc:.4f}, test NLL {nll:.4f}, {ep} epochs, growth time {tg:.0f}s "
+                    f"(tests {tt:.0f}s = {100 * tt / max(tg, TINY):.0f}%)")
             # (a) the architecture chosen by suplm, trained from scratch with the same epochs
             w_s, ep_s = ep_rule["suplm"]
             model, nll, acc, tf = fit_fixed(w_s, ep_s, Xtr, ytr, Xte, yte, args, seed, dev)
@@ -415,7 +447,7 @@ def run(args):
                 f"test NLL {nll:.4f} ({ep_s} epochs from scratch, {tf:.0f}s)")
             # (b) fixed widths with the same epoch budget as suplm (or a fixed number)
             ep_f = ep_s if args.fixed_epochs == "match" else int(args.fixed_epochs)
-            cand = ((2, 2), (8, 8), (16, 16), (32, 32), (args.cmax1, args.cmax2))
+            cand = ((2, 2), (8, 8), (16, 16), (32, 32), (64, 64), (args.cmax1, args.cmax2))
             fixed = sorted({w for w in cand if w[0] <= args.cmax1 and w[1] <= args.cmax2})
             for w in fixed:
                 model, nll, acc, tf = fit_fixed(w, ep_f, Xtr, ytr, Xte, yte, args, seed, dev)
@@ -428,14 +460,15 @@ def run(args):
             el = time.time() - t_all
             log(f"[{'#' * int(30 * done / total):<30s}] {done}/{total} data-seed pairs done, "
                 f"elapsed {el / 60:.1f} min, ETA {el / done * (total - done) / 60:.1f} min")
-            pd.DataFrame(rows).to_csv(f"{OUT}/cnn_raw.csv", index=False)
+            pd.DataFrame(rows).to_csv(f"{OUT}/{name_out}_raw.csv", index=False)
     df = pd.DataFrame(rows)
     summ = df.groupby(["data", "rule"]).agg(
         c1=("c1", "mean"), c2=("c2", "mean"), params=("params", "mean"),
         epochs=("epochs", "mean"), cap1=("cap1", "mean"), cap2=("cap2", "mean"),
         acc_mean=("test_acc", "mean"), acc_sd=("test_acc", "std"),
-        nll_mean=("test_nll", "mean"), time=("grow_time", "mean"), R=("seed", "size")).reset_index()
-    summ.to_csv(f"{OUT}/cnn.csv", index=False)
+        nll_mean=("test_nll", "mean"), time=("grow_time", "mean"),
+        test_share=("test_share", "mean"), R=("seed", "size")).reset_index()
+    summ.to_csv(f"{OUT}/{name_out}.csv", index=False)
     with pd.option_context("display.width", 200, "display.float_format", "{:.4f}".format):
         log("\n" + summ.to_string(index=False))
     LOGF.close()
@@ -443,7 +476,13 @@ def run(args):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data", nargs="+", default=["mnist", "fashion"], choices=["mnist", "fashion"])
+    ap.add_argument("--data", nargs="+", default=["mnist", "fashion"], choices=["mnist", "fashion", "cifar10"])
+    ap.add_argument("--rules", nargs="+", default=["suplm", "gradmax", "schedule", "gradmax_sched"],
+                    choices=["suplm", "gradmax", "schedule", "gradmax_sched"],
+                    help="growth rules (suplm is always needed: refit and fixed widths use its epochs)")
+    ap.add_argument("--out-name", default=None, help="prefix of the output files (default cnn, or cifar)")
+    ap.add_argument("--preset", choices=["cifar"], default=None,
+                    help="cifar: CIFAR-10, all 50000 training images, up to (64, 64) filters, 3 seeds")
     ap.add_argument("--seeds", type=int, default=5)
     ap.add_argument("--n-train", type=int, default=10000, help="training images used")
     ap.add_argument("--n-test", type=int, default=2000, help="training images used for each score test")
@@ -461,9 +500,19 @@ def main(argv=None):
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     ap.add_argument("--quick", action="store_true", help="tiny run to check the pipeline")
     args = ap.parse_args(argv)
+    if args.preset == "cifar":
+        args.data, args.n_train, args.cmax1, args.cmax2 = ["cifar10"], 50000, 64, 64
+        if args.seeds == 5:
+            args.seeds = 3
+        args.out_name = args.out_name or "cifar"
+    if args.out_name is None:
+        args.out_name = "cifar" if args.data == ["cifar10"] else "cnn"
+    if "suplm" not in args.rules:
+        args.rules = ["suplm"] + args.rules
     if args.quick:
         args.seeds, args.n_train, args.n_test, args.cmax1, args.cmax2 = 1, 2000, 300, 8, 6
-        args.M, args.B, args.epochs0, args.epochs1, args.data = 16, 49, 1, 1, ["mnist"]
+        args.M, args.B, args.epochs0, args.epochs1 = 16, 49, 1, 1
+        args.data = ["cifar10"] if args.preset == "cifar" else ["mnist"]
     run(args)
 
 

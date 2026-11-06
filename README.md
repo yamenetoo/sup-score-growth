@@ -124,19 +124,25 @@ All experiments are batched on the GPU (or CPU threads) and print detailed progr
 | `local` | E2 | power against weak (local) departures | `local_power.csv`, `local_power.pdf` |
 | `growth` | E3 | selection of the number of units, 4 designs (p = 2, 5, 10), n = 250/500/1000, 3 vs 10 restarts, cost | `growth.csv`, `growth_tests.txt` |
 | `real` | E4 | four real data sets (diabetes, California housing, kin8nm, cpu_act), 10-fold CV | `real_summary.csv`, `real_tests.txt` |
+| `kmax` | E4b | the real data sets at several maximal sizes $K_{\max}$ (8, 12, 16, 24): does each rule stop on its own, and what does it cost? | `kmax.csv`, `kmax_summary.csv` |
 | `sens` | E5 | grid size / scale, variance estimator, trigger thresholds | `sensitivity.csv` |
 | `init` | E6 | one-step initialisation of the new unit | `init.csv` |
 | `deep` | E7 | layer-wise growth of a two-hidden-layer network | `deep.csv`, `deep_tests.txt` |
 | CNN | E8 | exploratory growth of a convolutional network (MNIST, Fashion-MNIST) | `cnn.csv`, `cnn_log.txt` |
+| CIFAR | E9 | the same growth rules on CIFAR-10, up to (64, 64) filters, with a GradMax-style schedule | `cifar.csv`, `cifar_log.txt` |
 
 ```bash
 supgrow-experiments all --quick --devices cuda            # short check of every experiment
 supgrow-experiments all --devices cuda --batch 100        # full run
 supgrow-experiments growth real --devices cuda            # selected experiments
 supgrow-experiments deep --devices cuda --verbose 2       # one experiment, more detail
+supgrow-experiments real --kmax 16                        # E4 with K_max = 16
+supgrow-experiments kmax --kmax-levels 8 12 16 24         # E4b: several K_max from one path
 
 supgrow-cnn --quick                                       # CNN, small check
 supgrow-cnn --data mnist fashion --seeds 5                # CNN, full run
+supgrow-cnn --preset cifar --quick                        # CIFAR-10, small check
+supgrow-cnn --preset cifar                                # CIFAR-10 (E9), 3 seeds
 ```
 
 `python -m supgrow.experiments ...` and `python -m supgrow.cnn_growth ...` work the same way.
@@ -150,7 +156,9 @@ supgrow-cnn --data mnist fashion --seeds 5                # CNN, full run
 | `--fp64` | float64 on the GPU too (default: float32 on GPU, float64 on CPU) |
 | `--verbose 0/1/2` | 0: progress only; 1 (default): every fit, test and rule; 2: also optimiser iterations |
 
-The CNN experiment compares the proposed rule with a GradMax-type trigger and a schedule rule. Two fairness controls are included: the widths chosen by the test retrained from scratch (`suplm_refit`), and fixed widths trained for the same number of epochs as the test's run. Options: `--cmax1/--cmax2` (maximal filters, 48/32), `--M`, `--B`, `--epochs0/--epochs1`, `--fixed-epochs`.
+The CNN experiment compares the proposed rule with a GradMax-type trigger and a schedule rule. Two fairness controls are included: the widths chosen by the test retrained from scratch (`suplm_refit`), and fixed widths trained for the same number of epochs as the test's run. Options: `--cmax1/--cmax2` (maximal filters, 48/32), `--M`, `--B`, `--epochs0/--epochs1`, `--fixed-epochs`, `--rules`. The rule `gradmax_sched` follows GradMax: a fixed schedule up to the maximal widths, where each new filter is the candidate whose zero outgoing weights receive the largest gradient. The output also reports the share of the growth time spent in the tests (`test_share`).
+
+**How E4b works.** One path is fitted up to the largest level. A forward rule that stops at $\hat K$ when allowed to grow to the largest level would stop at $\min(\hat K, L)$ with maximal size $L$, and AIC, BIC and NIC are minimised over $0,\dots,L$. So every level is evaluated from the same fits, and the column `at_cap` shows how often each rule was stopped by the cap rather than by its own decision.
 
 **Hardware notes.**
 - *Windows laptop with one NVIDIA GPU:* keep `--per-gpu 1`. Each extra CUDA process needs several GB of RAM. If worker processes fail, the script finishes the remaining tasks in the main process.
@@ -175,8 +183,8 @@ sup-score-growth/
 │   ├── api.py             # high-level interface for one data set
 │   ├── growth_test.py     # batched LM fitting, sup-score statistic, bootstrap, competing rules
 │   ├── deep_growth.py     # vector test and layer-wise growth of deep networks
-│   ├── cnn_growth.py      # exploratory CNN growth (E8)
-│   └── experiments.py     # experiments E1–E7 (parallel, GPU)
+│   ├── cnn_growth.py      # CNN growth: MNIST, Fashion-MNIST (E8), CIFAR-10 (E9)
+│   └── experiments.py     # experiments E1–E7 and E4b (parallel, GPU)
 ├── notebooks/
 │   └── supgrow_colab.ipynb
 ├── results/               # outputs of the reported runs

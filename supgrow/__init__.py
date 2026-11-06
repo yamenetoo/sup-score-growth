@@ -12,7 +12,7 @@ supgrow.deep_growth   layer-wise growth of deep networks (vector test)
 supgrow.cnn_growth    exploratory growth of a convolutional network
 supgrow.experiments   the experiments of the paper (command line)
 """
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from supgrow.api import grow, sup_score_test, GrowthResult, default_scale
 
