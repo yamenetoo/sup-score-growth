@@ -46,6 +46,9 @@ Usage:
   python -m supgrow.cnn_growth --quick               # small check
   python -m supgrow.cnn_growth --data mnist fashion --seeds 5
   python -m supgrow.cnn_growth --preset cifar        # CIFAR-10 (E9)
+Parallel: every (data set, seed, rule) and every fixed-width fit is a job; jobs run
+in worker processes, --per-gpu per GPU (default 2) on all visible GPUs, or in one
+process when there is no GPU (--workers k for k CPU processes).
 Results: results/<name>_raw.csv, results/<name>.csv, results/<name>_log.txt with
 <name> = cnn (default) or cifar (--preset cifar), set by --out-name.
 """
@@ -406,62 +409,181 @@ def fit_fixed(widths, epochs, Xtr, ytr, Xte, yte, args, seed, dev):
     return model, nll, acc, time.time() - t0
 
 
+# ---------------------------------------------------------------------------
+# Jobs. Stage 1: one growth rule on one (data set, seed). Stage 2: SupLM refit
+# and fixed widths, which need the epochs of the SupLM run of the same seed.
+# Every job is seeded by (seed, rule), so results do not depend on how the
+# jobs are spread over processes and GPUs.
+# ---------------------------------------------------------------------------
+DEV = None          # device of this process (set by _worker_init or run)
+_DATA = {}          # one cached (data set, seed) per process
+
+
+def _get_data(name, args, seed):
+    key = (name, seed, args.n_train)
+    if key not in _DATA:
+        _DATA.clear()                                            # keep one data set in memory
+        if DEV is not None and DEV.type == "cuda":
+            torch.cuda.empty_cache()
+        _DATA[key] = load_data(name, args.n_train, DEV, seed)
+    return _DATA[key]
+
+
+def job_grow(name, seed, rule, args):
+    Xtr, ytr, Xte, yte = _get_data(name, args, seed)
+    gen = torch.Generator(device="cpu").manual_seed(1000 * seed + 7)
+    tag = f"{name}/s{seed}"
+    log(f"  {tag} START {rule} on {DEV}")
+    model, tg, ep, tt = grow(rule, Xtr, ytr, args, gen, tag)
+    nll, acc = evaluate(model, Xte, yte)
+    c1, c2 = model.widths()
+    log(f"  {tag} RESULT {rule}: widths {model.widths()}, params {model.n_params()}, "
+        f"test acc {acc:.4f}, test NLL {nll:.4f}, {ep} epochs, growth time {tg:.0f}s "
+        f"(tests {tt:.0f}s = {100 * tt / max(tg, TINY):.0f}%)")
+    return dict(data=name, seed=seed, rule=rule, c1=c1, c2=c2, params=model.n_params(),
+                epochs=ep, cap1=int(c1 >= args.cmax1), cap2=int(c2 >= args.cmax2),
+                test_nll=nll, test_acc=acc, grow_time=tg, test_time=tt,
+                test_share=tt / max(tg, TINY))
+
+
+def job_fixed(name, seed, label, widths, epochs, args):
+    Xtr, ytr, Xte, yte = _get_data(name, args, seed)
+    model, nll, acc, tf = fit_fixed(tuple(widths), epochs, Xtr, ytr, Xte, yte, args, seed, DEV)
+    log(f"  {name}/s{seed} RESULT {label} {tuple(widths)}: params {model.n_params()}, "
+        f"test acc {acc:.4f}, test NLL {nll:.4f} ({epochs} epochs from scratch, {tf:.0f}s, {DEV})")
+    capped = label == "suplm_refit"
+    return dict(data=name, seed=seed, rule=label, c1=widths[0], c2=widths[1], params=model.n_params(),
+                epochs=epochs, cap1=int(capped and widths[0] >= args.cmax1),
+                cap2=int(capped and widths[1] >= args.cmax2), test_nll=nll, test_acc=acc,
+                grow_time=np.nan, test_time=np.nan, test_share=np.nan)
+
+
+def _run_job(job):
+    kind, kw = job
+    t0 = time.time()
+    row = job_grow(**kw) if kind == "grow" else job_fixed(**kw)
+    return job, row, time.time() - t0
+
+
+def _stage2_jobs(name, seed, suplm_row, args):
+    """Refit of the SupLM widths and the fixed widths, with the SupLM epochs."""
+    w_s, ep_s = (int(suplm_row["c1"]), int(suplm_row["c2"])), int(suplm_row["epochs"])
+    ep_f = ep_s if args.fixed_epochs == "match" else int(args.fixed_epochs)
+    jobs = [("fixed", dict(name=name, seed=seed, label="suplm_refit", widths=w_s, epochs=ep_s, args=args))]
+    cand = ((2, 2), (8, 8), (16, 16), (32, 32), (64, 64), (args.cmax1, args.cmax2))
+    for w in sorted({w for w in cand if w[0] <= args.cmax1 and w[1] <= args.cmax2}):
+        jobs.append(("fixed", dict(name=name, seed=seed, label=f"fixed{w[0]}x{w[1]}", widths=w,
+                                   epochs=ep_f, args=args)))
+    return jobs
+
+
+def _worker_init(devices, counter, log_path, threads):
+    """Runs once in every worker process: pick a device, open the shared log."""
+    global DEV, LOGF
+    with counter.get_lock():
+        k = counter.value
+        counter.value += 1
+    DEV = torch.device(devices[k % len(devices)])
+    if DEV.type == "cuda":
+        torch.cuda.set_device(DEV)
+        torch.backends.cudnn.benchmark = True
+    torch.set_num_threads(threads)
+    LOGF = open(log_path, "a")
+
+
+def _devices(args):
+    """List of device names, one entry per worker slot."""
+    if args.device != "cpu" and torch.cuda.is_available():
+        gpus = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+        return [g for g in gpus for _ in range(max(1, args.per_gpu))]
+    return ["cpu"] * max(1, args.workers or 1)
+
+
 def run(args):
-    global LOGF
+    global LOGF, DEV
     os.makedirs(OUT, exist_ok=True)
     name_out = args.out_name
-    LOGF = open(f"{OUT}/{name_out}_log.txt", "a")
-    dev = torch.device("cuda" if torch.cuda.is_available() and args.device != "cpu" else "cpu")
+    log_path = f"{OUT}/{name_out}_log.txt"
+    LOGF = open(log_path, "a")
+    slots = _devices(args)
     log("=" * 70)
-    log(f"torch {torch.__version__} on {dev}"
-        + (f" ({torch.cuda.get_device_name(dev)})" if dev.type == "cuda" else "") + f"; options {vars(args)}")
-    rows = []
-    total = len(args.data) * args.seeds
-    done, t_all = 0, time.time()
-    for name in args.data:
-        for seed in range(args.seeds):
-            Xtr, ytr, Xte, yte = load_data(name, args.n_train, dev, seed)
-            log(f"data {name}, seed {seed}: train {tuple(Xtr.shape)}, test {tuple(Xte.shape)}")
-            ep_rule = {}
-            for rule in args.rules:
-                gen = torch.Generator(device="cpu").manual_seed(1000 * seed + 7)
-                tag = f"{name}/s{seed}"
-                model, tg, ep, tt = grow(rule, Xtr, ytr, args, gen, tag)
-                ep_rule[rule] = (model.widths(), ep)
-                nll, acc = evaluate(model, Xte, yte)
-                c1, c2 = model.widths()
-                rows.append(dict(data=name, seed=seed, rule=rule, c1=c1, c2=c2, params=model.n_params(),
-                                 epochs=ep, cap1=int(c1 >= args.cmax1), cap2=int(c2 >= args.cmax2),
-                                 test_nll=nll, test_acc=acc, grow_time=tg, test_time=tt,
-                                 test_share=tt / max(tg, TINY)))
-                log(f"  {tag} RESULT {rule}: widths {model.widths()}, params {model.n_params()}, "
-                    f"test acc {acc:.4f}, test NLL {nll:.4f}, {ep} epochs, growth time {tg:.0f}s "
-                    f"(tests {tt:.0f}s = {100 * tt / max(tg, TINY):.0f}%)")
-            # (a) the architecture chosen by suplm, trained from scratch with the same epochs
-            w_s, ep_s = ep_rule["suplm"]
-            model, nll, acc, tf = fit_fixed(w_s, ep_s, Xtr, ytr, Xte, yte, args, seed, dev)
-            rows.append(dict(data=name, seed=seed, rule="suplm_refit", c1=w_s[0], c2=w_s[1],
-                             params=model.n_params(), epochs=ep_s, cap1=int(w_s[0] >= args.cmax1),
-                             cap2=int(w_s[1] >= args.cmax2), test_nll=nll, test_acc=acc, grow_time=np.nan))
-            log(f"  {name}/s{seed} RESULT suplm_refit {w_s}: params {model.n_params()}, test acc {acc:.4f}, "
-                f"test NLL {nll:.4f} ({ep_s} epochs from scratch, {tf:.0f}s)")
-            # (b) fixed widths with the same epoch budget as suplm (or a fixed number)
-            ep_f = ep_s if args.fixed_epochs == "match" else int(args.fixed_epochs)
-            cand = ((2, 2), (8, 8), (16, 16), (32, 32), (64, 64), (args.cmax1, args.cmax2))
-            fixed = sorted({w for w in cand if w[0] <= args.cmax1 and w[1] <= args.cmax2})
-            for w in fixed:
-                model, nll, acc, tf = fit_fixed(w, ep_f, Xtr, ytr, Xte, yte, args, seed, dev)
-                rows.append(dict(data=name, seed=seed, rule=f"fixed{w[0]}x{w[1]}", c1=w[0], c2=w[1],
-                                 params=model.n_params(), epochs=ep_f, cap1=0, cap2=0,
-                                 test_nll=nll, test_acc=acc, grow_time=np.nan))
-                log(f"  {name}/s{seed} RESULT fixed {w}: params {model.n_params()}, test acc {acc:.4f}, "
-                    f"test NLL {nll:.4f} ({ep_f} epochs, {tf:.0f}s)")
-            done += 1
-            el = time.time() - t_all
-            log(f"[{'#' * int(30 * done / total):<30s}] {done}/{total} data-seed pairs done, "
-                f"elapsed {el / 60:.1f} min, ETA {el / done * (total - done) / 60:.1f} min")
-            pd.DataFrame(rows).to_csv(f"{OUT}/{name_out}_raw.csv", index=False)
-    df = pd.DataFrame(rows)
+    gpu = ", ".join(torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())) \
+        if torch.cuda.is_available() else "none"
+    log(f"torch {torch.__version__}; GPUs: {gpu}; worker slots: {len(slots)} {slots}; options {vars(args)}")
+    for name in args.data:                                       # download once, in the main process
+        try:
+            load_data(name, 10, torch.device("cpu"), 0)
+        except Exception as e:
+            log(f"WARNING: could not load {name}: {type(e).__name__}: {e}")
+    jobs = [("grow", dict(name=nm, seed=sd, rule=r, args=args))
+            for nm in args.data for sd in range(args.seeds) for r in args.rules]
+    n_total = len(jobs) + sum(len(_stage2_jobs(nm, sd, dict(c1=2, c2=2, epochs=1), args))
+                              for nm in args.data for sd in range(args.seeds))
+    rows, done, t_all = [], 0, time.time()
+
+    def finished(job, row, dt):
+        nonlocal done
+        rows.append(row)
+        done += 1
+        el = time.time() - t_all
+        log(f"[{'#' * int(30 * done / n_total):<30s}] {done}/{n_total} jobs done "
+            f"({job[1]['name']}/s{job[1]['seed']} {row['rule']}: acc {row['test_acc']:.4f}, {dt:.0f}s), "
+            f"elapsed {el / 60:.1f} min, ETA {el / done * (n_total - done) / 60:.1f} min")
+        pd.DataFrame(rows).to_csv(f"{OUT}/{name_out}_raw.csv", index=False)
+        if job[0] == "grow" and row["rule"] == "suplm":
+            return _stage2_jobs(row["data"], row["seed"], row, args)
+        return []
+
+    def run_inline(pending):
+        global DEV
+        DEV = torch.device(slots[0])
+        if DEV.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+        while pending:
+            job = pending.pop(0)
+            pending += finished(*_run_job(job))
+
+    if len(slots) == 1:
+        run_inline(jobs)
+    else:
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+        from concurrent.futures.process import BrokenProcessPool
+        os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
+        ctx = mp.get_context("spawn")                            # required for CUDA and on Windows
+        counter = ctx.Value("i", 0)
+        threads = max(1, (os.cpu_count() or 2) // len(slots))
+        pending, running, failed = list(jobs), {}, []
+        try:
+            with ProcessPoolExecutor(len(slots), mp_context=ctx, initializer=_worker_init,
+                                     initargs=(slots, counter, log_path, threads)) as ex:
+                while pending or running:
+                    while pending and len(running) < 2 * len(slots):
+                        job = pending.pop(0)
+                        running[ex.submit(_run_job, job)] = job
+                    fin, _ = wait(list(running), return_when=FIRST_COMPLETED)
+                    for fu in fin:
+                        job = running.pop(fu)
+                        try:
+                            pending += finished(*fu.result())
+                        except BrokenProcessPool:
+                            running[fu] = job                    # handled below: run it again inline
+                            raise
+                        except Exception as e:                   # e.g. CUDA out of memory in one job
+                            log(f"WARNING: job {job[0]} {job[1]['name']}/s{job[1]['seed']} "
+                                f"{job[1].get('rule', job[1].get('label'))} failed "
+                                f"({type(e).__name__}: {e}); it will be run again in the main process")
+                            failed.append(job)
+        except (BrokenProcessPool, MemoryError, OSError) as e:
+            log(f"WARNING: worker processes failed ({type(e).__name__}: {e}); "
+                f"finishing the remaining jobs in the main process (use --per-gpu 1 to avoid this)")
+            left = pending + list(running.values())
+            run_inline(left)
+        if failed:
+            log(f"running {len(failed)} failed job(s) in the main process")
+            run_inline(failed)
+    df = pd.DataFrame(rows).sort_values(["data", "seed", "rule"])
+    df.to_csv(f"{OUT}/{name_out}_raw.csv", index=False)
     summ = df.groupby(["data", "rule"]).agg(
         c1=("c1", "mean"), c2=("c2", "mean"), params=("params", "mean"),
         epochs=("epochs", "mean"), cap1=("cap1", "mean"), cap2=("cap2", "mean"),
@@ -471,6 +593,7 @@ def run(args):
     summ.to_csv(f"{OUT}/{name_out}.csv", index=False)
     with pd.option_context("display.width", 200, "display.float_format", "{:.4f}".format):
         log("\n" + summ.to_string(index=False))
+    log(f"total time {(time.time() - t_all) / 60:.1f} min")
     LOGF.close()
 
 
@@ -498,6 +621,11 @@ def main(argv=None):
     ap.add_argument("--epochs0", type=int, default=5, help="epochs before growth starts")
     ap.add_argument("--epochs1", type=int, default=2, help="epochs after each added filter")
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
+    ap.add_argument("--per-gpu", type=int, default=2,
+                    help="worker processes per GPU (the networks are small, so 2-3 keep a GPU busy; "
+                         "use 1 if Windows reports MemoryError)")
+    ap.add_argument("--workers", type=int, default=0,
+                    help="worker processes without a GPU (0 = 1, i.e. no parallelism)")
     ap.add_argument("--quick", action="store_true", help="tiny run to check the pipeline")
     args = ap.parse_args(argv)
     if args.preset == "cifar":
